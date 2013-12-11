@@ -1,0 +1,38 @@
+TOPSRCDIR = @top_srcdir@
+TOPOBJDIR = ../..
+SRCDIR    = @srcdir@
+VPATH     = @srcdir@
+MODULE    = ddraw.dll
+IMPORTLIB = libddraw.$(IMPLIBEXT)
+IMPORTS   = ole32 user32 gdi32 advapi32 kernel32 ntdll
+EXTRAINCL = @X_CFLAGS@
+EXTRALIBS = -ldxguid -luuid @X_LIBS@ @X_PRE_LIBS@ @XLIB@ @X_EXTRA_LIBS@ 
+
+C_SRCS = \
+	clipper.c \
+	ddraw.c \
+	ddraw_thunks.c \
+	device.c \
+	direct3d.c \
+	executebuffer.c \
+	gamma.c \
+	light.c \
+	main.c \
+	material.c \
+	palette.c \
+	parent.c \
+	regsvr.c \
+	surface.c \
+	surface_thunks.c \
+	texture.c \
+	utils.c \
+	vertexbuffer.c \
+	viewport.c
+
+RC_SRCS = version.rc
+
+SUBDIRS = tests
+
+@MAKE_DLL_RULES@
+
+### Dependencies:

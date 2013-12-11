@@ -1,0 +1,64 @@
+TOPSRCDIR = @top_srcdir@
+TOPOBJDIR = ..
+SRCDIR    = @srcdir@
+VPATH     = @srcdir@
+MODULE    = wine
+
+C_SRCS = \
+	glibc.c \
+	kthread.c \
+	main.c \
+	preloader.c \
+	pthread.c
+
+KTHREAD_OBJS = kthread.o main.o
+PTHREAD_OBJS = pthread.o main.o
+
+MAIN_BINARY    = @MAIN_BINARY@
+EXTRA_BINARIES = @EXTRA_BINARIES@
+WINE_BINARIES  = $(MAIN_BINARY) $(EXTRA_BINARIES)
+
+MANPAGES = wine.man
+
+INSTALLDIRS = $(DESTDIR)$(bindir) $(DESTDIR)$(mandir)/man$(prog_manext)
+
+all: $(WINE_BINARIES) $(MODULE) $(MANPAGES)
+
+@MAKE_RULES@
+
+LIBPTHREAD  = @LIBPTHREAD@
+LDEXECFLAGS = @LDEXECFLAGS@
+LDRPATH     = @LDEXERPATH@
+
+wine-glibc: glibc.o Makefile.in
+	$(CC) -o $@ glibc.o $(LDRPATH) $(LIBWINE) $(LIBPORT) $(LIBPTHREAD) $(EXTRALIBS) $(LDFLAGS)
+
+wine-preloader: preloader.o Makefile.in
+	$(CC) -o $@ -static -nostartfiles -nodefaultlibs -Wl,-Ttext=0x7c000000 preloader.o $(LIBPORT) $(LDFLAGS)
+
+wine-kthread: $(KTHREAD_OBJS) Makefile.in
+	$(CC) -o $@ $(LDEXECFLAGS) $(LDRPATH) $(KTHREAD_OBJS) $(LIBWINE) $(LIBPORT) $(EXTRALIBS) $(LDFLAGS)
+
+wine-pthread: $(PTHREAD_OBJS) Makefile.in
+	$(CC) -o $@ $(LDEXECFLAGS) $(LDRPATH) $(PTHREAD_OBJS) $(LIBWINE) $(LIBPORT) $(LIBPTHREAD) $(EXTRALIBS) $(LDFLAGS)
+
+$(MODULE): $(MAIN_BINARY)
+	$(RM) $(MODULE) && $(LN_S) $(MAIN_BINARY) $(MODULE)
+
+install:: $(WINE_BINARIES) $(MANPAGES) $(INSTALLDIRS)
+	for f in $(WINE_BINARIES); do \
+	  if [ "$(MAIN_BINARY)" = "$$f" ]; \
+	  then $(INSTALL_PROGRAM) $$f $(DESTDIR)$(bindir)/$(MODULE); \
+	  else $(INSTALL_PROGRAM) $$f $(DESTDIR)$(bindir)/$$f; \
+	  fi; \
+	done
+	$(INSTALL_DATA) wine.man $(DESTDIR)$(mandir)/man$(prog_manext)/wine.$(prog_manext)
+
+uninstall::
+	-cd $(DESTDIR)$(bindir) && $(RM) $(WINE_BINARIES) $(MODULE)
+	$(RM) $(DESTDIR)$(mandir)/man$(prog_manext)/wine.$(prog_manext)
+
+clean::
+	$(RM) $(WINE_BINARIES) $(MODULE)
+
+### Dependencies:

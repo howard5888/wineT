@@ -1,0 +1,40 @@
+# Global rules for building a static import library     -*-Makefile-*-
+#
+# Each individual makefile should define the following variables:
+# MODULE       : name of the main module being built
+#
+# plus all variables required by the global Make.rules.in
+#
+
+DLLFLAGS = @DLLFLAGS@
+DEFS     = -D__WINESRC__ $(EXTRADEFS)
+INSTALLDIRS = $(DESTDIR)$(dlldir)
+
+@MAKE_RULES@
+
+all: $(MODULE)
+
+# Rules for .a library
+
+$(MODULE): $(OBJS) Makefile.in
+	$(RM) $@
+	$(AR) $@ $(OBJS)
+	$(RANLIB) $@
+
+# Rules for installation
+
+install install-dev:: $(MODULE) $(DESTDIR)$(dlldir)
+	$(INSTALL_DATA) $(MODULE) $(DESTDIR)$(dlldir)/$(MODULE)
+
+install-lib::
+
+uninstall::
+	$(RM) $(DESTDIR)$(dlldir)/$(MODULE)
+
+# Misc. rules
+
+.PHONY: man doc-html doc-sgml
+
+man doc-html doc-sgml:
+
+# End of global library rules

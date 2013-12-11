@@ -1,0 +1,16 @@
+TOPSRCDIR = @top_srcdir@
+TOPOBJDIR = ../../..
+SRCDIR    = @srcdir@
+VPATH     = @srcdir@
+TESTDLL   = setupapi.dll
+IMPORTS   = setupapi kernel32
+
+CTESTS = \
+	devinst.c \
+	parser.c \
+	query.c \
+	stringtable.c
+
+@MAKE_TEST_RULES@
+
+### Dependencies:

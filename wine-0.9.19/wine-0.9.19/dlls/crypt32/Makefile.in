@@ -1,0 +1,31 @@
+EXTRADEFS = -D_CRYPT32_
+TOPSRCDIR = @top_srcdir@
+TOPOBJDIR = ../..
+SRCDIR    = @srcdir@
+VPATH     = @srcdir@
+MODULE    = crypt32.dll
+IMPORTLIB = libcrypt32.$(IMPLIBEXT)
+IMPORTS   = user32 advapi32 kernel32 ntdll
+
+C_SRCS = \
+	base64.c \
+	cert.c \
+	crl.c \
+	context.c \
+	decode.c \
+	encode.c \
+	oid.c \
+	proplist.c \
+	protectdata.c \
+	serialize.c \
+	store.c \
+	str.c \
+	main.c
+
+RC_SRCS = crypt32.rc
+
+SUBDIRS = tests
+
+@MAKE_DLL_RULES@
+
+### Dependencies:

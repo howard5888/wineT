@@ -1,0 +1,17 @@
+TOPSRCDIR = @top_srcdir@
+TOPOBJDIR = ../..
+SRCDIR    = @srcdir@
+VPATH     = @srcdir@
+MODULE    = dinput8.dll
+IMPORTLIB = libdinput8.$(IMPLIBEXT)
+IMPORTS   = dinput ole32 advapi32 kernel32
+EXTRALIBS = -luuid -ldxguid
+
+C_SRCS = \
+	dinput8_main.c
+
+RC_SRCS = version.rc
+
+@MAKE_DLL_RULES@
+
+### Dependencies:

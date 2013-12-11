@@ -1,0 +1,44 @@
+TOPSRCDIR = @top_srcdir@
+TOPOBJDIR = ../..
+SRCDIR    = @srcdir@
+VPATH     = @srcdir@
+EXEEXT    = @EXEEXT@
+
+PROGRAMS = winedump$(EXEEXT)
+MANPAGES = winedump.man
+MODULE   = none
+
+C_SRCS = \
+	debug.c \
+	dump.c \
+	emf.c \
+	le.c \
+	lnk.c \
+	main.c \
+	minidump.c \
+	misc.c \
+	msmangle.c \
+	ne.c \
+	output.c \
+	pe.c \
+	search.c \
+	symbol.c
+
+INSTALLDIRS = $(DESTDIR)$(bindir) $(DESTDIR)$(mandir)/man$(prog_manext)
+
+all: $(PROGRAMS) $(MANPAGES)
+
+@MAKE_RULES@
+
+winedump$(EXEEXT): $(OBJS)
+	$(CC) $(CFLAGS) -o winedump$(EXEEXT) $(OBJS) $(LIBPORT) $(LDFLAGS)
+
+install:: $(PROGRAMS) $(MANPAGES) $(INSTALLDIRS)
+	$(INSTALL_PROGRAM) winedump$(EXEEXT) $(DESTDIR)$(bindir)/winedump$(EXEEXT)
+	$(INSTALL_DATA) winedump.man $(DESTDIR)$(mandir)/man$(prog_manext)/winedump.$(prog_manext)
+	$(INSTALL_SCRIPT) $(SRCDIR)/function_grep.pl $(DESTDIR)$(bindir)/function_grep.pl
+
+uninstall::
+	$(RM) $(DESTDIR)$(bindir)/function_grep.pl $(DESTDIR)$(bindir)/winedump$(EXEEXT) $(DESTDIR)$(mandir)/man$(prog_manext)/winedump.$(prog_manext)
+
+### Dependencies:
