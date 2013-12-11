@@ -1,0 +1,724 @@
+/*
+ * Copyright 2011-2012 Con Kolivas
+ * Copyright 2010 Jeff Garzik
+ *
+ * This program is free software; you can redistribute it and/or modify it
+ * under the terms of the GNU General Public License as published by the Free
+ * Software Foundation; either version 3 of the License, or (at your option)
+ * any later version.  See COPYING for more details.
+ */
+
+#define _GNU_SOURCE
+#include "config.h"
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <ctype.h>
+#include <stdarg.h>
+#include <string.h>
+#include <jansson.h>
+#include <curl/curl.h>
+#include <time.h>
+#include <errno.h>
+#include <unistd.h>
+#include <sys/types.h>
+#ifndef WIN32
+# include <sys/socket.h>
+# include <netinet/in.h>
+# include <netinet/tcp.h>
+#else
+# include <winsock2.h>
+# include <mstcpip.h>
+#endif
+
+#include "miner.h"
+#include "elist.h"
+#include "compat.h"
+
+#if JANSSON_MAJOR_VERSION >= 2
+#define JSON_LOADS(str, err_ptr) json_loads((str), 0, (err_ptr))
+#else
+#define JSON_LOADS(str, err_ptr) json_loads((str), (err_ptr))
+#endif
+
+bool successful_connect = false;
+struct timeval nettime;
+
+struct data_buffer {
+	void		*buf;
+	size_t		len;
+};
+
+struct upload_buffer {
+	const void	*buf;
+	size_t		len;
+};
+
+struct header_info {
+	char		*lp_path;
+	int		rolltime;
+	char		*reason;
+	bool		hadrolltime;
+	bool		canroll;
+	bool		hadexpire;
+};
+
+struct tq_ent {
+	void			*data;
+	struct list_head	q_node;
+};
+
+static void databuf_free(struct data_buffer *db)
+{
+	if (!db)
+		return;
+
+	free(db->buf);
+
+	memset(db, 0, sizeof(*db));
+}
+
+static size_t all_data_cb(const void *ptr, size_t size, size_t nmemb,
+			  void *user_data)
+{
+	struct data_buffer *db = user_data;
+	size_t len = size * nmemb;
+	size_t oldlen, newlen;
+	void *newmem;
+	static const unsigned char zero = 0;
+
+	oldlen = db->len;
+	newlen = oldlen + len;
+
+	newmem = realloc(db->buf, newlen + 1);
+	if (!newmem)
+		return 0;
+
+	db->buf = newmem;
+	db->len = newlen;
+	memcpy(db->buf + oldlen, ptr, len);
+	memcpy(db->buf + newlen, &zero, 1);	/* null terminate */
+
+	return len;
+}
+
+static size_t upload_data_cb(void *ptr, size_t size, size_t nmemb,
+			     void *user_data)
+{
+	struct upload_buffer *ub = user_data;
+	unsigned int len = size * nmemb;
+
+	if (len > ub->len)
+		len = ub->len;
+
+	if (len) {
+		memcpy(ptr, ub->buf, len);
+		ub->buf += len;
+		ub->len -= len;
+	}
+
+	return len;
+}
+
+static size_t resp_hdr_cb(void *ptr, size_t size, size_t nmemb, void *user_data)
+{
+	struct header_info *hi = user_data;
+	size_t remlen, slen, ptrlen = size * nmemb;
+	char *rem, *val = NULL, *key = NULL;
+	void *tmp;
+
+	val = calloc(1, ptrlen);
+	key = calloc(1, ptrlen);
+	if (!key || !val)
+		goto out;
+
+	tmp = memchr(ptr, ':', ptrlen);
+	if (!tmp || (tmp == ptr))	/* skip empty keys / blanks */
+		goto out;
+	slen = tmp - ptr;
+	if ((slen + 1) == ptrlen)	/* skip key w/ no value */
+		goto out;
+	memcpy(key, ptr, slen);		/* store & nul term key */
+	key[slen] = 0;
+
+	rem = ptr + slen + 1;		/* trim value's leading whitespace */
+	remlen = ptrlen - slen - 1;
+	while ((remlen > 0) && (isspace(*rem))) {
+		remlen--;
+		rem++;
+	}
+
+	memcpy(val, rem, remlen);	/* store value, trim trailing ws */
+	val[remlen] = 0;
+	while ((*val) && (isspace(val[strlen(val) - 1])))
+		val[strlen(val) - 1] = 0;
+
+	if (!*val)			/* skip blank value */
+		goto out;
+
+	if (opt_protocol)
+		applog(LOG_DEBUG, "HTTP hdr(%s): %s", key, val);
+
+	if (!strcasecmp("X-Roll-Ntime", key)) {
+		hi->hadrolltime = true;
+		if (!strncasecmp("N", val, 1))
+			applog(LOG_DEBUG, "X-Roll-Ntime: N found");
+		else {
+			hi->canroll = true;
+
+			/* Check to see if expire= is supported and if not, set
+			 * the rolltime to the default scantime */
+			if (strlen(val) > 7 && !strncasecmp("expire=", val, 7)) {
+				sscanf(val + 7, "%d", &hi->rolltime);
+				hi->hadexpire = true;
+			} else
+				hi->rolltime = opt_scantime;
+			applog(LOG_DEBUG, "X-Roll-Ntime expiry set to %d", hi->rolltime);
+		}
+	}
+
+	if (!strcasecmp("X-Long-Polling", key)) {
+		hi->lp_path = val;	/* steal memory reference */
+		val = NULL;
+	}
+
+	if (!strcasecmp("X-Reject-Reason", key)) {
+		hi->reason = val;	/* steal memory reference */
+		val = NULL;
+	}
+
+out:
+	free(key);
+	free(val);
+	return ptrlen;
+}
+
+#ifdef CURL_HAS_SOCKOPT
+int json_rpc_call_sockopt_cb(void __maybe_unused *userdata, curl_socket_t fd,
+			     curlsocktype __maybe_unused purpose)
+{
+	int tcp_keepidle = 120;
+	int tcp_keepintvl = 120;
+
+#ifndef WIN32
+	int keepalive = 1;
+	int tcp_keepcnt = 5;
+
+	if (unlikely(setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &keepalive, sizeof(keepalive))))
+		return 1;
+
+# ifdef __linux
+
+	if (unlikely(setsockopt(fd, SOL_TCP, TCP_KEEPCNT, &tcp_keepcnt, sizeof(tcp_keepcnt))))
+		return 1;
+
+	if (unlikely(setsockopt(fd, SOL_TCP, TCP_KEEPIDLE, &tcp_keepidle, sizeof(tcp_keepidle))))
+		return 1;
+
+	if (unlikely(setsockopt(fd, SOL_TCP, TCP_KEEPINTVL, &tcp_keepintvl, sizeof(tcp_keepintvl))))
+		return 1;
+# endif /* __linux */
+# ifdef __APPLE_CC__
+
+	if (unlikely(setsockopt(fd, IPPROTO_TCP, TCP_KEEPALIVE, &tcp_keepintvl, sizeof(tcp_keepintvl))))
+		return 1;
+
+# endif /* __APPLE_CC__ */
+
+#else /* WIN32 */
+
+	struct tcp_keepalive vals;
+	vals.onoff = 1;
+	vals.keepalivetime = tcp_keepidle * 1000;
+	vals.keepaliveinterval = tcp_keepintvl * 1000;
+
+	DWORD outputBytes;
+
+	if (unlikely(WSAIoctl(fd, SIO_KEEPALIVE_VALS, &vals, sizeof(vals), NULL, 0, &outputBytes, NULL, NULL)))
+		return 1;
+
+#endif /* WIN32 */
+
+	return 0;
+}
+#endif
+
+static void last_nettime(struct timeval *last)
+{
+	rd_lock(&netacc_lock);
+	last->tv_sec = nettime.tv_sec;
+	last->tv_usec = nettime.tv_usec;
+	rd_unlock(&netacc_lock);
+}
+
+static void set_nettime(void)
+{
+	wr_lock(&netacc_lock);
+	gettimeofday(&nettime, NULL);
+	wr_unlock(&netacc_lock);
+}
+
+json_t *json_rpc_call(CURL *curl, const char *url,
+		      const char *userpass, const char *rpc_req,
+		      bool probe, bool longpoll, int *rolltime,
+		      struct pool *pool, bool share)
+{
+	long timeout = longpoll ? (60 * 60) : 60;
+	struct data_buffer all_data = {NULL, 0};
+	struct header_info hi = {NULL, 0, NULL, false, false, false};
+	char len_hdr[64], user_agent_hdr[128];
+	char curl_err_str[CURL_ERROR_SIZE];
+	struct curl_slist *headers = NULL;
+	struct upload_buffer upload_data;
+	json_t *val, *err_val, *res_val;
+	bool probing = false;
+	json_error_t err;
+	int rc;
+
+	memset(&err, 0, sizeof(err));
+
+	/* it is assumed that 'curl' is freshly [re]initialized at this pt */
+
+	if (probe)
+		probing = !pool->probed;
+	curl_easy_setopt(curl, CURLOPT_TIMEOUT, timeout);
+
+#if 0 /* Disable curl debugging since it spews to stderr */
+	if (opt_protocol)
+		curl_easy_setopt(curl, CURLOPT_VERBOSE, 1);
+#endif
+	curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1);
+	curl_easy_setopt(curl, CURLOPT_URL, url);
+	curl_easy_setopt(curl, CURLOPT_ENCODING, "");
+	curl_easy_setopt(curl, CURLOPT_FAILONERROR, 1);
+
+	/* Shares are staggered already and delays in submission can be costly
+	 * so do not delay them */
+	if (!opt_delaynet || share)
+		curl_easy_setopt(curl, CURLOPT_TCP_NODELAY, 1);
+	curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, all_data_cb);
+	curl_easy_setopt(curl, CURLOPT_WRITEDATA, &all_data);
+	curl_easy_setopt(curl, CURLOPT_READFUNCTION, upload_data_cb);
+	curl_easy_setopt(curl, CURLOPT_READDATA, &upload_data);
+	curl_easy_setopt(curl, CURLOPT_ERRORBUFFER, curl_err_str);
+	curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1);
+	curl_easy_setopt(curl, CURLOPT_HEADERFUNCTION, resp_hdr_cb);
+	curl_easy_setopt(curl, CURLOPT_HEADERDATA, &hi);
+	curl_easy_setopt(curl, CURLOPT_USE_SSL, CURLUSESSL_TRY);
+	if (opt_socks_proxy) {
+		curl_easy_setopt(curl, CURLOPT_PROXY, opt_socks_proxy);
+		curl_easy_setopt(curl, CURLOPT_PROXYTYPE, CURLPROXY_SOCKS4);
+	}
+	if (userpass) {
+		curl_easy_setopt(curl, CURLOPT_USERPWD, userpass);
+		curl_easy_setopt(curl, CURLOPT_HTTPAUTH, CURLAUTH_BASIC);
+	}
+#ifdef CURL_HAS_SOCKOPT
+	if (longpoll)
+		curl_easy_setopt(curl, CURLOPT_SOCKOPTFUNCTION, json_rpc_call_sockopt_cb);
+#endif
+	curl_easy_setopt(curl, CURLOPT_POST, 1);
+
+	if (opt_protocol)
+		applog(LOG_DEBUG, "JSON protocol request:\n%s", rpc_req);
+
+	upload_data.buf = rpc_req;
+	upload_data.len = strlen(rpc_req);
+	sprintf(len_hdr, "Content-Length: %lu",
+		(unsigned long) upload_data.len);
+	sprintf(user_agent_hdr, "User-Agent: %s", PACKAGE_STRING);
+
+	headers = curl_slist_append(headers,
+		"Content-type: application/json");
+	headers = curl_slist_append(headers,
+		"X-Mining-Extensions: longpoll midstate rollntime submitold");
+
+	if (likely(global_hashrate)) {
+		char ghashrate[255];
+
+		sprintf(ghashrate, "X-Mining-Hashrate: %llu", global_hashrate);
+		headers = curl_slist_append(headers, ghashrate);
+	}
+
+	headers = curl_slist_append(headers, len_hdr);
+	headers = curl_slist_append(headers, user_agent_hdr);
+	headers = curl_slist_append(headers, "Expect:"); /* disable Expect hdr*/
+
+	curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+
+	if (opt_delaynet) {
+		/* Don't delay share submission, but still track the nettime */
+		if (!share) {
+			long long now_msecs, last_msecs;
+			struct timeval now, last;
+
+			gettimeofday(&now, NULL);
+			last_nettime(&last);
+			now_msecs = (long long)now.tv_sec * 1000;
+			now_msecs += now.tv_usec / 1000;
+			last_msecs = (long long)last.tv_sec * 1000;
+			last_msecs += last.tv_usec / 1000;
+			if (now_msecs > last_msecs && now_msecs - last_msecs < 250) {
+				struct timespec rgtp;
+
+				rgtp.tv_sec = 0;
+				rgtp.tv_nsec = (250 - (now_msecs - last_msecs)) * 1000000;
+				nanosleep(&rgtp, NULL);
+			}
+		}
+		set_nettime();
+	}
+
+	rc = curl_easy_perform(curl);
+	if (rc) {
+		applog(LOG_INFO, "HTTP request failed: %s", curl_err_str);
+		goto err_out;
+	}
+
+	if (!all_data.buf) {
+		applog(LOG_DEBUG, "Empty data received in json_rpc_call.");
+		goto err_out;
+	}
+
+	if (probing) {
+		pool->probed = true;
+		/* If X-Long-Polling was found, activate long polling */
+		if (hi.lp_path) {
+			if (pool->hdr_path != NULL)
+				free(pool->hdr_path);
+			pool->hdr_path = hi.lp_path;
+		} else
+			pool->hdr_path = NULL;
+	} else if (hi.lp_path) {
+		free(hi.lp_path);
+		hi.lp_path = NULL;
+	}
+
+	*rolltime = hi.rolltime;
+	pool->cgminer_pool_stats.rolltime = hi.rolltime;
+	pool->cgminer_pool_stats.hadrolltime = hi.hadrolltime;
+	pool->cgminer_pool_stats.canroll = hi.canroll;
+	pool->cgminer_pool_stats.hadexpire = hi.hadexpire;
+
+	val = JSON_LOADS(all_data.buf, &err);
+	if (!val) {
+		applog(LOG_INFO, "JSON decode failed(%d): %s", err.line, err.text);
+
+		if (opt_protocol)
+			applog(LOG_DEBUG, "JSON protocol response:\n%s", all_data.buf);
+
+		goto err_out;
+	}
+
+	if (opt_protocol) {
+		char *s = json_dumps(val, JSON_INDENT(3));
+
+		applog(LOG_DEBUG, "JSON protocol response:\n%s", s);
+		free(s);
+	}
+
+	/* JSON-RPC valid response returns a non-null 'result',
+	 * and a null 'error'.
+	 */
+	res_val = json_object_get(val, "result");
+	err_val = json_object_get(val, "error");
+
+	if (!res_val || json_is_null(res_val) ||
+	    (err_val && !json_is_null(err_val))) {
+		char *s;
+
+		if (err_val)
+			s = json_dumps(err_val, JSON_INDENT(3));
+		else
+			s = strdup("(unknown reason)");
+
+		applog(LOG_INFO, "JSON-RPC call failed: %s", s);
+
+		free(s);
+
+		goto err_out;
+	}
+
+	if (hi.reason) {
+		json_object_set_new(val, "reject-reason", json_string(hi.reason));
+		free(hi.reason);
+		hi.reason = NULL;
+	}
+	successful_connect = true;
+	databuf_free(&all_data);
+	curl_slist_free_all(headers);
+	curl_easy_reset(curl);
+	return val;
+
+err_out:
+	databuf_free(&all_data);
+	curl_slist_free_all(headers);
+	curl_easy_reset(curl);
+	if (!successful_connect)
+		applog(LOG_DEBUG, "Failed to connect in json_rpc_call");
+	curl_easy_setopt(curl, CURLOPT_FRESH_CONNECT, 1);
+	return NULL;
+}
+
+char *bin2hex(const unsigned char *p, size_t len)
+{
+	char *s = malloc((len * 2) + 1);
+	unsigned int i;
+
+	if (!s)
+		return NULL;
+
+	for (i = 0; i < len; i++)
+		sprintf(s + (i * 2), "%02x", (unsigned int) p[i]);
+
+	return s;
+}
+
+bool hex2bin(unsigned char *p, const char *hexstr, size_t len)
+{
+	while (*hexstr && len) {
+		char hex_byte[3];
+		unsigned int v;
+
+		if (!hexstr[1]) {
+			applog(LOG_ERR, "hex2bin str truncated");
+			return false;
+		}
+
+		hex_byte[0] = hexstr[0];
+		hex_byte[1] = hexstr[1];
+		hex_byte[2] = 0;
+
+		if (sscanf(hex_byte, "%x", &v) != 1) {
+			applog(LOG_ERR, "hex2bin sscanf '%s' failed", hex_byte);
+			return false;
+		}
+
+		*p = (unsigned char) v;
+
+		p++;
+		hexstr += 2;
+		len--;
+	}
+
+	return (len == 0 && *hexstr == 0) ? true : false;
+}
+
+bool fulltest(const unsigned char *hash, const unsigned char *target)
+{
+	unsigned char hash_swap[32], target_swap[32];
+	uint32_t *hash32 = (uint32_t *) hash_swap;
+	uint32_t *target32 = (uint32_t *) target_swap;
+	char *hash_str, *target_str;
+	bool rc = true;
+	int i;
+
+	swap256(hash_swap, hash);
+	swap256(target_swap, target);
+
+	for (i = 0; i < 32/4; i++) {
+		uint32_t h32tmp = swab32(hash32[i]);
+		uint32_t t32tmp = target32[i];
+
+		target32[i] = swab32(target32[i]);	/* for printing */
+
+		if (h32tmp > t32tmp) {
+			rc = false;
+			break;
+		}
+		if (h32tmp < t32tmp) {
+			rc = true;
+			break;
+		}
+	}
+
+	if (opt_debug) {
+		hash_str = bin2hex(hash_swap, 32);
+		target_str = bin2hex(target_swap, 32);
+
+		applog(LOG_DEBUG, " Proof: %s\nTarget: %s\nTrgVal? %s",
+			hash_str,
+			target_str,
+			rc ? "YES (hash < target)" :
+			     "no (false positive; hash > target)");
+
+		free(hash_str);
+		free(target_str);
+	}
+
+	return rc;
+}
+
+struct thread_q *tq_new(void)
+{
+	struct thread_q *tq;
+
+	tq = calloc(1, sizeof(*tq));
+	if (!tq)
+		return NULL;
+
+	INIT_LIST_HEAD(&tq->q);
+	pthread_mutex_init(&tq->mutex, NULL);
+	pthread_cond_init(&tq->cond, NULL);
+
+	return tq;
+}
+
+void tq_free(struct thread_q *tq)
+{
+	struct tq_ent *ent, *iter;
+
+	if (!tq)
+		return;
+
+	list_for_each_entry_safe(ent, iter, &tq->q, q_node) {
+		list_del(&ent->q_node);
+		free(ent);
+	}
+
+	pthread_cond_destroy(&tq->cond);
+	pthread_mutex_destroy(&tq->mutex);
+
+	memset(tq, 0, sizeof(*tq));	/* poison */
+	free(tq);
+}
+
+static void tq_freezethaw(struct thread_q *tq, bool frozen)
+{
+	mutex_lock(&tq->mutex);
+
+	tq->frozen = frozen;
+
+	pthread_cond_signal(&tq->cond);
+	mutex_unlock(&tq->mutex);
+}
+
+void tq_freeze(struct thread_q *tq)
+{
+	tq_freezethaw(tq, true);
+}
+
+void tq_thaw(struct thread_q *tq)
+{
+	tq_freezethaw(tq, false);
+}
+
+bool tq_push(struct thread_q *tq, void *data)
+{
+	struct tq_ent *ent;
+	bool rc = true;
+
+	ent = calloc(1, sizeof(*ent));
+	if (!ent)
+		return false;
+
+	ent->data = data;
+	INIT_LIST_HEAD(&ent->q_node);
+
+	mutex_lock(&tq->mutex);
+
+	if (!tq->frozen) {
+		list_add_tail(&ent->q_node, &tq->q);
+	} else {
+		free(ent);
+		rc = false;
+	}
+
+	pthread_cond_signal(&tq->cond);
+	mutex_unlock(&tq->mutex);
+
+	return rc;
+}
+
+void *tq_pop(struct thread_q *tq, const struct timespec *abstime)
+{
+	struct tq_ent *ent;
+	void *rval = NULL;
+	int rc;
+
+	mutex_lock(&tq->mutex);
+
+	if (!list_empty(&tq->q))
+		goto pop;
+
+	if (abstime)
+		rc = pthread_cond_timedwait(&tq->cond, &tq->mutex, abstime);
+	else
+		rc = pthread_cond_wait(&tq->cond, &tq->mutex);
+	if (rc)
+		goto out;
+	if (list_empty(&tq->q))
+		goto out;
+
+pop:
+	ent = list_entry(tq->q.next, struct tq_ent, q_node);
+	rval = ent->data;
+
+	list_del(&ent->q_node);
+	free(ent);
+
+out:
+	mutex_unlock(&tq->mutex);
+	return rval;
+}
+
+int thr_info_create(struct thr_info *thr, pthread_attr_t *attr, void *(*start) (void *), void *arg)
+{
+	return pthread_create(&thr->pth, attr, start, arg);
+}
+
+void thr_info_freeze(struct thr_info *thr)
+{
+	struct tq_ent *ent, *iter;
+	struct thread_q *tq;
+
+	if (!thr)
+		return;
+
+	tq = thr->q;
+	if (!tq)
+		return;
+
+	mutex_lock(&tq->mutex);
+	tq->frozen = true;
+	list_for_each_entry_safe(ent, iter, &tq->q, q_node) {
+		list_del(&ent->q_node);
+		free(ent);
+	}
+	mutex_unlock(&tq->mutex);
+}
+
+void thr_info_cancel(struct thr_info *thr)
+{
+	if (!thr)
+		return;
+
+	if (PTH(thr) != 0L) {
+		pthread_cancel(thr->pth);
+		PTH(thr) = 0L;
+	}
+}
+
+/* Provide a ms based sleep that uses nanosleep to avoid poor usleep accuracy
+ * on SMP machines */
+void nmsleep(unsigned int msecs)
+{
+	struct timespec twait, tleft;
+	int ret;
+	ldiv_t d;
+
+	d = ldiv(msecs, 1000);
+	tleft.tv_sec = d.quot;
+	tleft.tv_nsec = d.rem * 1000000;
+	do {
+		twait.tv_sec = tleft.tv_sec;
+		twait.tv_nsec = tleft.tv_nsec;
+		ret = nanosleep(&twait, &tleft);
+	} while (ret == -1 && errno == EINTR);
+}
+
+/* Returns the microseconds difference between end and start times as a double */
+double us_tdiff(struct timeval *end, struct timeval *start)
+{
+	return end->tv_sec * 1000000 + end->tv_usec - start->tv_sec * 1000000 - start->tv_usec;
+}
